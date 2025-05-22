@@ -1,0 +1,510 @@
+---
+title: "ExcessMort_US"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(segmented)
+library(rstanarm)
+library(doBy)
+library(dplyr)
+library(forecast)
+library(gridExtra)
+library(ggthemes)
+```
+
+
+```{r functions, echo=F}
+getQuantiles <- function(x, req.qs=c(0.025, 0.05, seq(0.1, 0.9, by=.1), .95, .975, 0.25, 0.75)){
+  x <- apply(x, 1, function(y) quantile(y, req.qs)) |> t()
+  colnames(x) <- paste0('q_', req.qs)
+  
+  x
+}
+
+
+processAgg <- function(x){
+  x <- dcast(x, geo+age+year+date+deaths+pop~variable)
+  
+  data.table(dplyr::select(x, geo, age, year, date, deaths, pop),
+             dplyr::select(x, -c(geo, age, year, date, deaths, pop))|> as.matrix() |> getQuantiles(),
+             pr=select(x, -c(geo, age, year, date, deaths, pop))|> as.matrix() |> 
+               apply(1, function(y) round(sum(y > 0)/length(y), 4))) ## prob x > 0 ## meaningful for excess only
+}
+
+
+# Using segmented regression following STL decomposition
+altTrend <- function(d2, train.start, train.end){
+  d2 <- mutate(d2, log_pop=log(pop))
+  splitBy(~age, d2) |>
+    lapply(function(x){
+      train.age <<- filter(x, date >= train.start, date < train.end) ## Making global as selgmented throws error saying it is unable to find data object used for GLM.
+      test.age <<- filter(x, date >= train.end) 
+      
+      ### Find trend in mortality rate using STL deomcposition 
+      x.stl <- train.age$rate %>%
+        ts(frequency=52) %>%
+        stats::stl(s.window = 'periodic')
+      train.age$trend.stl <<- forecast::trendcycle(x.stl)  # fit
+      
+      ### find breakpoints in the trend
+      glm.seg <- glm(trend.stl~trend, data=train.age, family=gaussian())
+      
+      seg.model <- selgmented(glm.seg, seg.Z=~trend, msg=F)
+      
+      
+      n.breaks <- seg.model$selection.psi$npsi
+      if(n.breaks > 0){
+        train.age$trend <- seg.model$fitted.values ## Overwrite default trend (simple sequence)
+        
+        final.slope <- slope(seg.model)$trend[, 'Est.'] |> tail(1)
+        final.intercept <- intercept(seg.model)$trend[, 'Est.'] |> tail(1)
+        test.age$trend <- test.age$trend*final.slope + final.intercept ## assume the last known slope+intercept continues through the forecast period (?)
+      } 
+      
+      rbind(dplyr::select(train.age, -trend.stl), test.age)
+    }) |> 
+    rbindlist()
+}
+
+
+fitModel <- function(d, train.start='2015-01-01', train.end='2020-01-01', segmented.trend=F, return.model=T){
+  d <- d[age != 'TOTAL'] ## we do not want this aggregated strata in the model
+  
+  if(segmented.trend == T){
+    d <- altTrend(d, train.start, train.end)
+  }
+  
+  
+  train <- filter(d, date >= train.start, date < train.end)
+  test <- filter(d, date >= train.end) |>
+    mutate(deaths=if_else(is.na(deaths), 0, deaths))
+  
+  
+  
+  model <- rstanarm::stan_glm.nb( #  stan_glm.nb takes too long with stl trend, but is fine with integer, linear trend
+    deaths ~ offset(log(pop)) + # age-specific population offset
+      age + trend + seasonality + age:trend + age:seasonality,
+    data = train,
+    chains = 4, 
+    seed = 3542
+  )
+  
+  # ## inspect model
+  # shinystan::launch_shinystan(model)
+  # pp_check(model, nreps=100, plotfun = 'ppc_dens_overlay_grouped', group='age', size=.2, alpha=.5) + facet_wrap(~group, nrow=1)
+  # pp_check(model, nreps=100, plotfun = 'ppc_scatter_avg_grouped', group='age', size=1, alpha=.5, facet_args=list(nrow=1, scales='free'))
+  # pp_check(model, nreps=100, plotfun = 'ppc_violin_grouped', group='age', size=.5, alpha=.5, probs = c(0.025, 0.5, 0.975), y_size=.5, y_alpha=.75)
+  
+  
+  
+  fit <- rstanarm::posterior_predict(
+    model,
+    newdata=train,
+    offset=log(train$pop)
+  )
+  
+  
+  ### Fitted deaths at the leaf nodes
+  fit.leaves <- data.table(subset(train, select=c(age, geo, year, date, deaths, pop)), getQuantiles(t(fit)))
+  ### Aggregate up the tree
+  fit.agg <- melt(data.table(subset(train, select=c(age, geo, year, date, deaths, pop)), t(fit)), 
+                  id.vars = c('age', 'geo', 'year', 'date', 'deaths', 'pop'))
+  fit.agg <- fit.agg[, j=.(age='TOTAL', value=sum(value), pop=sum(pop), deaths=sum(deaths, na.rm = T)), by=.(geo,  year, date, variable)]|> 
+    processAgg()|> 
+    dplyr::select(!pr)
+  
+  fit.agg <- rbind(fit.leaves, fit.agg)
+  
+  
+  
+  
+  ### Get posterior over projection period
+  pred <- rstanarm::posterior_predict(
+    model,
+    newdata=test,
+    offset=log(test$pop)
+  )
+  
+  ### Expected deaths at the leaf nodes
+  pred.leaves <- data.table(subset(test, select=c(age, geo, year, date, deaths, pop)), getQuantiles(t(pred)))
+  
+  ### Excess deaths at the leaf nodes
+  excess.leaves <- melt(data.table(subset(test, select=c(age, geo, year, date, deaths, pop)), t(pred)), 
+                        id.vars = c('age', 'geo', 'year', 'date', 'deaths', 'pop')) |>
+    mutate(value=(deaths-value)) |>
+    processAgg()
+  
+  
+  
+  ### Aggregate up the tree
+  pred.agg <- melt(data.table(subset(test, select=c(age, geo, year, date, deaths, pop)), t(pred)), 
+                   id.vars = c('age', 'geo', 'year', 'date', 'deaths', 'pop'))
+  
+  ## Aggregate posteriors of EXCESS across age groups
+  excess.agg <- rbind(
+    excess.leaves,
+    pred.agg[, j=.(age='TOTAL', value=sum(value), pop=sum(pop), deaths=sum(deaths, na.rm = T)), by=.(geo, year, date, variable)] |> 
+      mutate(value=(deaths-value)) |> processAgg()
+  )
+  
+  
+  ## Aggregate posteriors of EXPECTED across age groups 
+  pred.agg <- rbind(
+    pred.leaves,
+    pred.agg[, j=.(age='TOTAL', value=sum(value), pop=sum(pop), deaths=sum(deaths, na.rm = T)), by=.(geo,  year, date, variable)] |> 
+      processAgg() |> 
+      dplyr::select(!pr) # combine ages
+  )
+  
+  if(return.model == T){
+    return(list(pred.agg, excess.agg, fit.agg, model))
+  } else{
+    return(list(pred.agg, excess.agg, fit.agg))
+  }  
+}
+
+
+fitModelGAMM <- function(d, train.start='2015-01-01', train.end='2020-01-01', return.model=T){
+  d <- d[age != 'TOTAL'] ## we do not want this aggregated strata in the model
+  
+  d$age <- factor(d$age)
+  
+  train <- filter(d, date >= train.start, date < train.end)
+  test <- filter(d, date >= train.end) |>
+    mutate(deaths=if_else(is.na(deaths), 0, deaths))
+  
+  
+  
+  model <- rstanarm::stan_gamm4(
+    deaths ~ offset(log(pop)) + # age-specific population offset
+      s(year, k = length(unique(train$year)), by=age) + # annual trend
+      s(week, bs = "cc", k = 52, by=age) + # cyclic spline for seasonality
+      age, #  variable for leaf nodes age 
+    data = train,
+    family = neg_binomial_2(link='log'),
+    chains=2, ##changed from default to reduce runtime. Need to be increased for 'production' models 
+    QR=T,
+    seed = 3542
+  )
+  
+  # ## inspect model
+  # shinystan::launch_shinystan(model)
+  # pp_check(model, nreps=100, plotfun = 'ppc_dens_overlay_grouped', group='age', size=.2, alpha=.5) + facet_wrap(~group, nrow=1)
+  # pp_check(model, nreps=100, plotfun = 'ppc_scatter_avg_grouped', group='age', size=1, alpha=.5, facet_args=list(nrow=1, scales='free'))
+  # pp_check(model, nreps=100, plotfun = 'ppc_violin_grouped', group='age', size=.5, alpha=.5, probs = c(0.025, 0.5, 0.975), y_size=.5, y_alpha=.75)
+  
+  
+  
+  fit <- rstanarm::posterior_predict(
+    model,
+    newdata=train,
+    offset=log(train$pop)
+  )
+  ### Fitted deaths at the leaf nodes
+  fit.leaves <- data.table(subset(train, select=c(age, geo, year, date, deaths, pop)), getQuantiles(t(fit)))
+  ### Aggregate up the tree
+  fit.agg <- melt(data.table(subset(train, select=c(age, geo, year, date, deaths, pop)), t(fit)), 
+                  id.vars = c('age', 'geo', 'year', 'date', 'deaths', 'pop'))
+  fit.agg <- fit.agg[, j=.(age='TOTAL', value=sum(value), pop=sum(pop), deaths=sum(deaths, na.rm = T)), by=.(geo,  year, date, variable)]|> 
+    processAgg()|> 
+    dplyr::select(!pr)
+  
+  fit.agg <- rbind(fit.leaves, fit.agg)
+  
+  
+  
+  
+  ### Get posterior over projection period
+  pred <- rstanarm::posterior_predict(
+    model,
+    newdata=test,
+    offset=log(test$pop)
+  )
+  
+  ### Expected deaths at the leaf nodes
+  pred.leaves <- data.table(subset(test, select=c(age, geo, year, date, deaths, pop)), getQuantiles(t(pred)))
+  
+  ### Excess deaths at the leaf nodes
+  excess.leaves <- melt(data.table(subset(test, select=c(age, geo, year, date, deaths, pop)), t(pred)), 
+                        id.vars = c('age', 'geo', 'year', 'date', 'deaths', 'pop')) |>
+    mutate(value=(deaths-value)) |>
+    processAgg()
+  
+  
+  
+  ### Aggregate up the tree
+  pred.agg <- melt(data.table(subset(test, select=c(age, geo, year, date, deaths, pop)), t(pred)), 
+                   id.vars = c('age', 'geo', 'year', 'date', 'deaths', 'pop'))
+  
+  ## Aggregate posteriors of EXCESS across age groups
+  excess.agg <- rbind(
+    excess.leaves,
+    pred.agg[, j=.(age='TOTAL', value=sum(value), pop=sum(pop), deaths=sum(deaths, na.rm = T)), by=.(geo, year, date, variable)] |> 
+      mutate(value=(deaths-value)) |> processAgg()
+  )
+  
+  
+  ## Aggregate posteriors of EXPECTED across age groups 
+  pred.agg <- rbind(
+    pred.leaves,
+    pred.agg[, j=.(age='TOTAL', value=sum(value), pop=sum(pop), deaths=sum(deaths, na.rm = T)), by=.(geo,  year, date, variable)] |> 
+      processAgg() |> 
+      dplyr::select(!pr) # combine ages
+  )
+  
+  if(return.model == T){
+    return(list(pred.agg, excess.agg, fit.agg, model))
+  } else{
+    return(list(pred.agg, excess.agg, fit.agg))
+  }
+  
+}
+
+plotDensity <- function(x){
+  x$model$age_2 <- factor(x$model$age,
+                        levels=c("Y_LT45", "Y_45-64", "Y_65-74", "Y_75-84", "Y_GE85"),
+                        labels=c("<45 yrs", "45-64 yrs", "65-74 yrs", "75-84 yrs", "85+ yrs"))
+  
+  pp_check(x, nreps=100, plotfun = 'ppc_dens_overlay_grouped', group='age', size=.2, alpha=.25) + 
+    facet_wrap(~group, nrow=2, scales = 'free') + 
+    labs(x='Deaths, count', y='Density') +
+    theme(legend.position = 'bottom', axis.text = element_text(size=10, family = 'serif'), axis.title = element_text(size=12, family = 'serif'),
+          strip.text = element_text(size=14, family = 'serif')) +
+    xlim(c(0, NA))
+  
+}
+
+plotScatter <- function(x){
+  x$model$age_2 <- factor(x$model$age,
+                        levels=c("Y_LT45", "Y_45-64", "Y_65-74", "Y_75-84", "Y_GE85"),
+                        labels=c("<45 yrs", "45-64 yrs", "65-74 yrs", "75-84 yrs", "85+ yrs"))
+
+
+  pp_check(x, nreps=100, plotfun = 'ppc_scatter_avg_grouped', group='age_2', size=.5, alpha=.25, facet_args=list(nrow=2, scales='free')) + 
+    theme(legend.position = 'bottom', axis.text = element_text(size=10, family = 'serif'), axis.title = element_text(size=12, family = 'serif'), 
+          strip.text = element_text(size=14, family = 'serif')) 
+  
+}
+
+gamTrendPlots <- function(x){
+  ##### GAM smooth predictors for week and year####
+  req.predictors <- c('s(week):ageY_LT45', 's(week):ageY_45-64', 's(week):ageY_65-74', 's(week):ageY_75-84', 's(week):ageY_GE85',
+                      's(year):ageY_LT45', 's(year):ageY_45-64', 's(year):ageY_65-74', 's(year):ageY_75-84', 's(year):ageY_GE85')
+  req.predictors.levels <- factor(req.predictors, levels=req.predictors)
+  
+  plot_nonlinear(x, prob=.95, alpha=.75, size=.5, smooths = req.predictors, 
+                 facet_args = list(ncol=5, scales='free_x', strip.position='top', 
+                                   labeller=labeller(term = ~ forcats::fct_relevel(req.predictors.levels, .x) |> forcats::fct_relabel(relabel)))) +
+    geom_hline(yintercept = 0, linetype='dashed') + 
+    labs(x='Predictor', y='Estimate') +
+    scale_x_continuous(breaks=seq(2010, 2023, by=4)) +
+    theme(axis.text.y = element_text(size=8, family='serif'), axis.title = element_text(size=12, family='serif'), 
+          strip.text = element_text(size=14, family='serif'))
+  
+  
+}
+
+glmCoeffPlot <- function(x){
+  ggplot(x) +
+    geom_point(aes(y=variable, x=`50%`), position = position_dodge(width=.75), color='red', shape=1) +
+    geom_linerange(aes(y=variable, xmin=`10%`, xmax = `90%`), position = position_dodge(width=.75), color='red') +
+    geom_vline(xintercept=0, linetype='dashed') +
+    labs(x='Estimate, median (10%-90%)', y='Predictor') +
+    ggthemes::theme_clean() + theme(legend.position = 'bottom', axis.title = element_text(size=12, family='serif'),
+                                    axis.text.x=element_text(size=6, family='serif'),  axis.text.y = element_text(size=12, family='serif'))
+}
+
+relabel <- function(lbl){
+  lbl <- gsub('age','', lbl)
+  lbl <- gsub('Y_LT45','<45 yrs', lbl)
+  lbl <- gsub('Y_45-64','45-64 yrs', lbl)
+  lbl <- gsub('Y_65-74','65-74 yrs', lbl)
+  lbl <- gsub('Y_75-84','75-84 yrs', lbl)
+  lbl <- gsub('Y_GE85','85+ yrs', lbl)
+  
+  lbl
+}
+
+```
+
+
+```{r modelBuild, echo=FALSE}
+setwd('.')
+options(mc.cores=parallel::detectCores())
+
+### set the location of interest, end of training period and type of model
+req.loc <- 'WA' ## US or state. NOT one of following as they have missing data: 'AK', 'DC', 'DE', 'HI', 'ID', 'ME', 'MT', 'ND', 'NE', 'NH', 'RI', 'SD', 'VT', 'WY'
+req.train.end <- as.Date('2019-12-31')
+req.model <- 'GAM'
+
+#####
+
+### load historical datasets saved from NCHS after cleaning; create trend and seasonality variables
+d <- fread('../data/NCHS_clean.csv') |>
+  mutate(seasonality = sin(2*pi*week/52.14) + cos(2*pi*week/52.14)) |> ## Serfling formulation
+  arrange(geo, age, date)
+
+d$trend <- ave(as.numeric(d$date), d$geo, d$age, FUN=seq_along) 
+
+
+if(req.model=='GLM'){
+  ## build a model, can take 1+ hour
+  model <- fitModel(d[geo.code == req.loc], train.end = req.train.end, segmented.trend = T)
+  save(model, file='../results/WA_GLM.RData')
+  
+  # # Or load saved model
+  # load('../results/WA_GLM.RData')
+} else{
+  ## build a model, can take 1+ hour
+  model <- fitModelGAMM(d[geo.code == req.loc], train.end = req.train.end)
+  save(model, file='../results/WA_GAM.RData')
+  
+  # # load saved model
+  # load('../results/WA_GAM.RData')
+}
+
+print(paste0('Location:', req.loc, ' | Training end:', req.train.end, ' | Model:', req.model), quote=F)
+```
+
+#### Overall model fit and projection  + excess estimate    
+
+```{r plot1, echo=FALSE, fig.width=8, fig.height=8}
+age.levels.us <- c('TOTAL', 'Y_LT45', 'Y_45-64', 'Y_65-74', 'Y_75-84', 'Y_GE85')
+
+pred <- mutate(model[[1]], age=factor(age, age.levels.us))
+excess <- mutate(model[[2]], age=factor(age, age.levels.us))
+fit <- mutate(model[[3]], age=factor(age, age.levels.us))
+
+d2 <- filter(excess, age == 'TOTAL', date < '2024-07-01') |> mutate(model=req.model)
+p1 <- ggplot(d2) +
+  geom_line(aes(x=date, y=q_0.5, color=model)) +
+  geom_ribbon(aes(x=date, ymin=q_0.25, ymax=q_0.75, fill=model), alpha=.4) +
+  geom_ribbon(aes(x=date, ymin=q_0.025, ymax=q_0.975, fill=model), alpha=.2) +
+  geom_point(data=filter(d2,  pr > .95), aes(x=date, y=0, color=model), shape=1, size=.9, color='darkgreen') +
+  scale_fill_manual(values=c( 'red')) +
+  scale_color_manual(values=c('red')) +
+  geom_hline(aes(yintercept=0), linetype='dashed') +
+  guides(color='none', fill='none') +
+  scale_y_continuous(labels = scales::label_number(scale=1e-3)) +
+  labs(x='Date', y='Excess deaths, count (thousands)') +
+  theme_clean() + theme(legend.position = 'bottom', axis.title=element_text(size=14, family='serif'), strip.text = element_text(size=14, family='serif'),
+                        axis.text.y=element_text(size=8, family='serif'), panel.background = element_rect())
+
+p2 <- rbind(filter(fit, age == 'TOTAL') |> mutate(period='fit'),
+            filter(pred, age == 'TOTAL') |> mutate(period='pred')) |>
+  filter(date < '2024-07-01') |>
+  ggplot() +
+  geom_line(aes(x=date, y=q_0.5, color=period)) +
+  geom_point(aes(x=date, y=deaths, color=period), size=.5) +
+  geom_ribbon(aes(x=date, ymin=q_0.25, ymax=q_0.75, fill=period), alpha=.7) +
+  geom_ribbon(aes(x=date, ymin=q_0.025, ymax=q_0.975, fill=period), alpha=.3) +
+  geom_vline(xintercept=as.Date(req.train.end), linetype='dashed') +
+  scale_fill_manual(values=c('lightblue', 'orange')) +
+  scale_color_manual(values=c('darkblue', 'indianred')) +
+  guides(color='none', fill='none') +
+  scale_y_continuous(labels = scales::label_number(scale=1e-3)) +
+  labs(x='Date', y='Expected deaths, count (thousands)') +
+  theme_clean() + theme(legend.position = 'bottom', axis.title=element_text(size=14, family='serif'), strip.text = element_text(size=14, family='serif'),
+                        axis.text.y=element_text(size=8, family='serif'), panel.background = element_rect())
+
+grid.arrange(p2, p1, ncol=1) # 1400 x 900
+
+```
+
+#### Fit and projection by age group    
+
+
+```{r plot2, echo=FALSE, fig.width=8, fig.height=16}
+rbind(filter(fit, age != 'TOTAL') |> mutate(period='fit'),
+      filter(pred, age != 'TOTAL') |> mutate(period='pred')) |>
+  filter(date < '2024-07-01', date > '2018-01-01') |>
+  ggplot() +
+  geom_line(aes(x=date, y=q_0.5, color=period)) +
+  geom_point(aes(x=date, y=deaths, color=period), size=.5) +
+  geom_ribbon(aes(x=date, ymin=q_0.25, ymax=q_0.75, fill=period), alpha=.7) +
+  geom_ribbon(aes(x=date, ymin=q_0.025, ymax=q_0.975, fill=period), alpha=.3) +
+  geom_vline(xintercept=as.Date(req.train.end), linetype='dashed') +
+  scale_fill_manual(values=c('lightblue', 'orange')) +
+  scale_color_manual(values=c('darkblue', 'indianred')) +
+  scale_y_continuous(labels = scales::label_number(scale=1e-3)) +
+  facet_wrap(~age, scales='free_y', ncol=1) + guides(color='none', fill='none') +
+  labs(x='Date', y='Expected deaths, count (thousands)', title=req.loc) +
+  theme_clean() + theme(legend.position = 'bottom', axis.title=element_text(size=14, family='serif'), strip.text = element_text(size=14, family='serif'),
+                        axis.text.y=element_text(size=8, family='serif'), panel.background = element_rect())
+
+```
+
+#### Excess estimate by age group    
+
+
+```{r plot3, echo=FALSE, fig.width=8, fig.height=16}
+d2 <- filter(excess, age != 'TOTAL', date < '2024-07-01') |> mutate(model=req.model)
+ggplot(d2) +
+  geom_line(aes(x=date, y=q_0.5, color=model)) +
+  geom_ribbon(aes(x=date, ymin=q_0.25, ymax=q_0.75, fill=model), alpha=.4) +
+  geom_ribbon(aes(x=date, ymin=q_0.025, ymax=q_0.975, fill=model), alpha=.2) +
+  geom_point(data=filter(d2,  pr > .95), aes(x=date, y=0, color=model), shape=1, size=.9, color='darkgreen') +
+  scale_fill_manual(values=c( 'red')) +
+  scale_color_manual(values=c('red')) +
+  geom_hline(aes(yintercept=0), linetype='dashed') +
+  facet_wrap(~age, scales='free_y', ncol=1) + guides(color='none', fill='none') +
+  scale_y_continuous(labels = scales::label_number(scale=1e-3)) +
+  labs(x='Date', y='Excess deaths, count (thousands)', title=req.loc) +
+  theme_clean() + theme(legend.position = 'bottom', axis.title=element_text(size=14, family='serif'), strip.text = element_text(size=14, family='serif'),
+                        axis.text.y=element_text(size=8, family='serif'), panel.background = element_rect())
+```
+
+#### Probability of excess by age group    
+
+
+```{r plot4, echo=FALSE, fig.width=12, fig.height=6}
+filter(excess, date < '2024-07-01') |>
+  ggplot() +
+  geom_raster(aes(x=date, y=age, fill=pr)) +
+  scale_fill_gradient2(low='darkblue', high='#bd0026', midpoint=.5, mid='#fecc5c') +
+  geom_vline(xintercept=as.Date(req.train.end), linetype='dashed', linewidth=.25)+
+  labs(x='Date', fill= 'Probability of excess mortality', y= 'Age group') +
+  theme_clean() + theme(legend.position = 'bottom', panel.background = element_rect(fill = NULL), 
+                        strip.text = element_text(size=14, family='serif'), axis.text.y = element_text(size=12, family = 'serif'),
+                        axis.title = element_text(size=14, family='serif'), legend.text = element_text(size=8))
+```
+
+
+#### Posterior checks    
+```{r plot5, echo=FALSE, fig.width=12, fig.height=9}
+## this should work for both models
+plotDensity(model[[4]])
+#plotScatter(model[[4]])
+```
+
+
+#### Effect estimates     
+```{r plot6, echo=FALSE, fig.width=12, fig.height=6}
+if(!'gamm4' %in% class(model[[4]])){
+  glm.variables <- summary(model[[4]]) |> 
+    rownames()
+  glm.coeff <- summary(model[[4]]) |> as.data.frame() |> 
+    mutate(variable=glm.variables) |>
+    filter(!variable %in% c('log-posterior', 'mean_PPD', 'reciprocal_dispersion')) |>
+    mutate(variable=factor(variable, levels=c('trend', 'seasonality', 
+                                              'ageY_LT45', 'ageY_65-74', 'ageY_75-84', 'ageY_GE85',
+                                              'ageY_LT45:trend', 'ageY_65-74:trend', 'ageY_75-84:trend', 'ageY_GE85:trend',
+                                              'ageY_LT45:seasonality', 'ageY_65-74:seasonality', 'ageY_75-84:seasonality', 'ageY_GE85:seasonality','(Intercept)')),
+           variable.group = variable) |>
+    arrange(variable.group, variable) 
+  
+  ## plot all coefficients    
+  glm.coeff |>  
+    glmCoeffPlot()
+  
+  # ## zoom in on small estimates 
+  # glm.coeff |>  filter(abs(`50%`) < .5) |>
+  #  glmCoeffPlot()
+} else{
+  ## smoothing functions, weekly and annual for the GAM model
+  gamTrendPlots(model[[4]])
+}
+```
