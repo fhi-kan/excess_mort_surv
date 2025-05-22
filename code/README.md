@@ -1,0 +1,3 @@
+- ExcessMort_Euro.rmd – R markdown script of model implementation for Europe
+- ExcessMort_US.rmd - R markdown script of model implementation for US
+- *.html – sample output from above scripts
